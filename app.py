@@ -6,12 +6,60 @@ import io
 import json
 import re
 
-import anthropic
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+
+# ══════════════════════════════════════════════════════════════════
+#  支持的模型提供商配置
+# ══════════════════════════════════════════════════════════════════
+
+PROVIDERS = {
+    "Anthropic Claude": {
+        "type": "anthropic",
+        "api_url": "https://api.anthropic.com",
+        "models": ["claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
+        "help": "前往 https://console.anthropic.com 获取 API Key",
+    },
+    "DeepSeek": {
+        "type": "openai",
+        "api_url": "https://api.deepseek.com",
+        "models": ["deepseek-chat", "deepseek-reasoner"],
+        "help": "前往 https://platform.deepseek.com 获取 API Key",
+    },
+    "Qwen (通义千问)": {
+        "type": "openai",
+        "api_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "models": ["qwen-max", "qwen-plus", "qwen-turbo"],
+        "help": "前往 https://dashscope.console.aliyun.com 获取 API Key",
+    },
+    "MiMo (小米)": {
+        "type": "openai",
+        "api_url": "https://api.xiaoai.mi.com/v1",
+        "models": ["MiMo", "MiMo-v2"],
+        "help": "前往小米开放平台获取 API Key",
+    },
+    "Moonshot (Kimi)": {
+        "type": "openai",
+        "api_url": "https://api.moonshot.cn/v1",
+        "models": ["moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"],
+        "help": "前往 https://platform.moonshot.cn 获取 API Key",
+    },
+    "Zhipu (智谱 GLM)": {
+        "type": "openai",
+        "api_url": "https://open.bigmodel.cn/api/paas/v4",
+        "models": ["glm-4-flash", "glm-4", "glm-4-plus"],
+        "help": "前往 https://open.bigmodel.cn 获取 API Key",
+    },
+    "OpenAI 兼容 (自定义)": {
+        "type": "openai",
+        "api_url": "",
+        "models": ["gpt-4o", "gpt-4o-mini"],
+        "help": "输入任意 OpenAI 兼容的 API 地址和 Key",
+    },
+}
 
 # ──────────────────────────── 页面配置 ────────────────────────────
 st.set_page_config(
@@ -129,18 +177,36 @@ def build_columns_info(df: pd.DataFrame) -> str:
     return "\n".join(lines)
 
 
-def call_api_for_chart_spec(user_query: str, df: pd.DataFrame, api_key: str, model: str) -> dict | None:
-    """调用 Anthropic Claude API 解析自然语言为图表规格"""
+def call_api_for_chart_spec(user_query: str, df: pd.DataFrame, api_key: str, model: str,
+                            provider_name: str, custom_url: str = "") -> dict | None:
+    """统一 API 调用：支持 Anthropic 和 OpenAI 兼容接口"""
+    prov = PROVIDERS[provider_name]
+    columns_info = build_columns_info(df)
+    system_prompt = CHART_SPEC_SYSTEM.format(columns_info=columns_info)
+
     try:
-        client = anthropic.Anthropic(api_key=api_key)
-        columns_info = build_columns_info(df)
-        message = client.messages.create(
-            model=model,
-            max_tokens=512,
-            system=CHART_SPEC_SYSTEM.format(columns_info=columns_info),
-            messages=[{"role": "user", "content": user_query}],
-        )
-        text = message.content[0].text.strip()
+        if prov["type"] == "anthropic":
+            import anthropic
+            client = anthropic.Anthropic(api_key=api_key)
+            message = client.messages.create(
+                model=model, max_tokens=512,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_query}],
+            )
+            text = message.content[0].text.strip()
+        else:
+            from openai import OpenAI
+            base_url = custom_url or prov["api_url"]
+            client = OpenAI(api_key=api_key, base_url=base_url)
+            response = client.chat.completions.create(
+                model=model, max_tokens=512,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_query},
+                ],
+            )
+            text = response.choices[0].message.content.strip()
+
         # 提取 JSON（兼容 markdown code block）
         match = re.search(r"\{[\s\S]*\}", text)
         if match:
@@ -395,10 +461,36 @@ def main():
     # ── 侧边栏: API 配置 & 数据上传 ──
     with st.sidebar:
         st.header("⚙️ 设置")
-        api_key = st.text_input("Anthropic API Key", type="password",
-                                help="输入你的 Anthropic API Key 以启用 AI 图表生成；留空则使用本地解析")
-        model_choice = st.selectbox("模型", ["claude-sonnet-4-6", "claude-haiku-4-5-20251001"], index=0)
+
+        # 模型提供商选择
+        provider_name = st.selectbox("选择模型提供商", list(PROVIDERS.keys()), index=0)
+        provider = PROVIDERS[provider_name]
+
+        # 模型选择（允许自定义输入）
+        model_choice = st.selectbox(
+            "选择模型",
+            provider["models"],
+            index=0,
+            key=f"model_{provider_name}",
+        )
+        custom_model = st.text_input("或输入自定义模型名", placeholder="留空则使用上方选择",
+                                      key=f"custom_model_{provider_name}")
+        if custom_model.strip():
+            model_choice = custom_model.strip()
+
+        # API Key
+        api_key = st.text_input("API Key", type="password",
+                                help=provider["help"])
         use_api = bool(api_key)
+
+        # 自定义 API URL（仅 OpenAI 兼容类型且需要时显示）
+        custom_url = ""
+        if provider["type"] == "openai":
+            custom_url = st.text_input(
+                "API Base URL (可选)",
+                value=provider["api_url"],
+                help="如需使用其他兼容接口地址，在此修改",
+            )
 
         st.markdown("---")
         st.header("  数据上传")
@@ -501,10 +593,11 @@ def main():
         if st.button("  生成图表", type="primary", disabled=not user_query.strip()):
             with st.spinner("正在分析指令并生成图表..."):
                 if use_api:
-                    spec = call_api_for_chart_spec(user_query, df, api_key, model_choice)
+                    spec = call_api_for_chart_spec(user_query, df, api_key, model_choice,
+                                                   provider_name, custom_url)
                     if spec is None:
                         spec = local_parse_chart_spec(user_query, df)
-                    source = "API (Claude)" if spec else "本地解析"
+                    source = f"API ({provider_name})" if spec else "本地解析"
                 else:
                     spec = local_parse_chart_spec(user_query, df)
                     source = "本地关键词解析"
@@ -539,7 +632,8 @@ def main():
                     if follow_up.strip():
                         merged_query = f"{user_query}。补充要求: {follow_up}"
                         if use_api:
-                            new_spec = call_api_for_chart_spec(merged_query, df, api_key, model_choice)
+                            new_spec = call_api_for_chart_spec(merged_query, df, api_key, model_choice,
+                                                                         provider_name, custom_url)
                             if not new_spec:
                                 new_spec = local_parse_chart_spec(merged_query, df)
                         else:
@@ -582,9 +676,11 @@ def main():
 
         ### API 配置
 
-        - 在左侧输入 **Anthropic API Key** 启用 AI 智能解析
+        - 在左侧选择 **模型提供商**（支持 Anthropic Claude、DeepSeek、Qwen、MiMo、Moonshot、智谱 GLM 等）
+        - 输入对应平台的 **API Key** 启用 AI 智能解析
+        - 支持输入 **自定义模型名**，适配各平台最新模型
+        - 对于 OpenAI 兼容接口，可自定义 **API Base URL**
         - 不输入 Key 也可使用，系统会自动切换到本地关键词解析模式
-        - 推荐使用 `claude-sonnet-4-6` 模型以获得最佳解析效果
 
         ### 数据要求
 
